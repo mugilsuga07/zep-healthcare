@@ -1,0 +1,11 @@
+services:
+  db:
+    image: ankane/pgvector
+    container_name: pgsql_jhm_healthcare
+    ports:
+      - 5435:5432
+    volumes:
+      - ./sql:/docker-entrypoint-initdb.d
+    environment:
+      - POSTGRES_PASSWORD=charizards
+      - POSTGRES_USER=postgres
