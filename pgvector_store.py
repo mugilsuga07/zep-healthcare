@@ -3,105 +3,42 @@ from typing import Any, List, Optional, Union
 from uuid import uuid4
 
 import sqlalchemy
-from sqlalchemy import Column, String, Integer, Boolean, ForeignKey, TIMESTAMP
-from sqlalchemy.dialects.postgresql import UUID, JSONB
-from pgvector.sqlalchemy import Vector
-from sqlalchemy.orm import declarative_base
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
+from llama_index.core.bridge.pydantic import PrivateAttr
+from llama_index.core.schema import BaseNode, MetadataMode
+from llama_index.core.vector_stores.types import (
+    BasePydanticVectorStore,
+    MetadataFilters,
+    VectorStoreQuery,
+    VectorStoreQueryResult,
+)
+from llama_index.core.vector_stores.utils import (
+    metadata_dict_to_node,
+    node_to_metadata_dict,
+)
+from kb import KB, KBDocs
 
-class MetadataFilters:
-    pass
+import logging
 
-class BaseNode:
-    def get_embedding(self):
-        return [0.0] * 1536
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-    def get_content(self, metadata_mode=None):
-        return "content"
-
-    def set_content(self, content):
-        pass
-
-    def node_id(self):
-        return str(uuid4())
-
-class VectorStoreQuery:
-    def __init__(self):
-        self.query_embedding = None
-        self.similarity_top_k = 10
-        self.filters = None
-
-class VectorStoreQueryResult:
-    def __init__(self, nodes, similarities, ids):
-        self.nodes = nodes
-        self.similarities = similarities
-        self.ids = ids
-
-Base = declarative_base()
-
-class KB(Base):
-    __tablename__ = "kb"
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
-    name = Column(String(1024))
-    data_type = Column(String(24))
-    metadata_ = Column("metadata", JSONB)
-    status = Column(String(24))
-    created_by = Column(UUID(as_uuid=True))
-    created_date = Column(TIMESTAMP(timezone=True))
-    last_modified_by = Column(UUID(as_uuid=True))
-    last_modified_date = Column(TIMESTAMP(timezone=True))
-    is_deleted = Column(Boolean, default=False)
-    organization_id = Column(UUID(as_uuid=True), nullable=True)
-    object_acl = Column(JSONB, nullable=True)
-    tenant_id = Column(UUID(as_uuid=True), default=None)
-
-class KBDocs(Base):
-    __tablename__ = "kb_docs"
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
-    kb_id = Column(UUID(as_uuid=True), ForeignKey('kb.id'), nullable=False)
-    title = Column(String, nullable=False)
-    item_metadata = Column("item_metadata", JSONB)
-    text = Column(String, nullable=True)
-    url = Column(String, nullable=True)
-    tokens = Column(Integer, nullable=True)
-    embedding = Column(Vector(1536))
-    created_by = Column(UUID(as_uuid=True))
-    created_date = Column(TIMESTAMP(timezone=True))
-    last_modified_by = Column(UUID(as_uuid=True))
-    last_modified_date = Column(TIMESTAMP(timezone=True))
-    is_deleted = Column(Boolean, default=False)
-    organization_id = Column(UUID(as_uuid=True), nullable=True)
-    object_acl = Column(JSONB, nullable=True)
-    tenant_id = Column(UUID(as_uuid=True), default=None)
-
-class PGVectorStore:
+class PGVectorStore(BasePydanticVectorStore):
     stores_text = True
     flat_metadata = False
-
-    def __init__(
-        self,
-        connection_string: Union[str, sqlalchemy.engine.URL],
-        async_connection_string: Union[str, sqlalchemy.engine.URL],
-        embed_dim: int = 1536,
-        tenant_id: str = "",
-        organization_id: Optional[str] = None,
-        current_user: Optional[str] = None,
-        debug: bool = False,
-    ) -> None:
-        self.connection_string = connection_string
-        self.async_connection_string = async_connection_string
-        self.embed_dim = embed_dim
-        self.tenant_id = tenant_id
-        self.organization_id = organization_id
-        self.current_user = current_user
-        self.debug = debug
-        self._is_initialized = False
-
-    async def async_close(self) -> None:
-        if not self._is_initialized:
-            return
-        await self._async_engine.dispose()
+    connection_string: str
+    async_connection_string: Union[str, sqlalchemy.engine.URL]
+    embed_dim: int
+    tenant_id: str
+    debug = False
+    organization_id: Optional[str] = None
+    current_user: Optional[str] = None
+    _engine: Any = PrivateAttr()
+    _session: Any = PrivateAttr()
+    _async_engine: Any = PrivateAttr()
+    _async_session: Any = PrivateAttr()
+    _is_initialized: bool = PrivateAttr(default=False)
 
     def _connect(self) -> None:
         from sqlalchemy import create_engine
@@ -115,83 +52,118 @@ class PGVectorStore:
     def _initialize(self) -> None:
         if not self._is_initialized:
             self._connect()
+            from sqlalchemy import inspect
+            inspector = inspect(self._engine)
+            table_names = inspector.get_table_names()
+            print(f"Existing tables: {table_names}")
+            if 'kbdocs' not in table_names:
+                print("Table 'kbdocs' not found, creating it...")
+                Base.metadata.create_all(self._engine)
+                print("Table 'kbdocs' created.")
+            else:
+                print("Table 'kbdocs' already exists, not creating it.")
             self._is_initialized = True
 
-    @property
-    def client(self) -> Any:
-        if not self._is_initialized:
-            self._initialize()
-        return self._engine
+    def add(self, nodes: List[BaseNode], kb_metadata: dict, **add_kwargs: Any) -> List[str]:
+        self._initialize()
+        ids = []
+
+        with self._session() as session:
+            existing_kb = session.query(KB).filter_by(
+                name=kb_metadata.get("name"),
+                tenant_id=self.tenant_id,
+                organization_id=self.organization_id
+            ).first()
+
+            if existing_kb:
+                kb_id = existing_kb.id
+            else:
+                kb_id = str(uuid4())
+                kb_record = KB(
+                    id=kb_id,
+                    name=kb_metadata.get("name"),
+                    data_type=kb_metadata.get("data_type"),
+                    metadata=kb_metadata.get("metadata"),
+                    status=kb_metadata.get("status"),
+                    created_by=self.current_user,
+                    created_date=datetime.now(),
+                    last_modified_by=self.current_user,
+                    last_modified_date=datetime.now(),
+                    organization_id=self.organization_id,
+                    tenant_id=self.tenant_id
+                )
+                session.add(kb_record)
+                session.commit()
+
+        with self._session() as session, session.begin():
+            for node in nodes:
+                ids.append(node.node_id)
+                item = self._node_to_table_row(node, kb_id)
+                session.add(item)
+            session.commit()
+        return ids
+
+    # Implement other necessary methods like async_add, _node_to_table_row, _build_query, etc.
+
+    async def async_add(self, nodes: List[BaseNode], kb_metadata: dict, **kwargs: Any) -> List[str]:
+        self._initialize()
+        ids = []
+
+        async with self._async_session() as session:
+            existing_kb = await session.execute(
+                sqlalchemy.select(KB).filter_by(
+                    name=kb_metadata.get("name"),
+                    tenant_id=self.tenant_id,
+                    organization_id=self.organization_id
+                )
+            )
+            existing_kb = existing_kb.scalar()
+
+            if existing_kb:
+                kb_id = existing_kb.id
+            else:
+                kb_id = str(uuid4())
+                kb_record = KB(
+                    id=kb_id,
+                    name=kb_metadata.get("name"),
+                    data_type=kb_metadata.get("data_type"),
+                    metadata=kb_metadata.get("metadata"),
+                    status=kb_metadata.get("status"),
+                    created_by=self.current_user,
+                    created_date=datetime.now(),
+                    last_modified_by=self.current_user,
+                    last_modified_date=datetime.now(),
+                    organization_id=self.organization_id,
+                    tenant_id=self.tenant_id
+                )
+                session.add(kb_record)
+                await session.commit()
+
+        async with self._async_session() as session, session.begin():
+            for node in nodes:
+                ids.append(node.node_id)
+                item = self._node_to_table_row(node, kb_id)
+                session.add(item)
+            await session.commit()
+        return ids
 
     def _node_to_table_row(self, node: BaseNode, kb_id: str) -> Any:
         return KBDocs(
-            id=node.node_id(),
+            id=node.node_id,
             kb_id=kb_id,
             embedding=node.get_embedding(),
-            title=node.get_content(),
-            item_metadata={},  # Replace with actual metadata conversion
+            title=node.get_content(metadata_mode=MetadataMode.NONE),
+            item_metadata=node_to_metadata_dict(
+                node,
+                remove_text=True,
+                flat_metadata=self.flat_metadata,
+            ),
             text=node.get_content(),
             created_by=self.current_user,
             last_modified_by=self.current_user,
             organization_id=self.organization_id,
             tenant_id=self.tenant_id,
         )
-
-    def add(self, nodes: List[BaseNode], kb_metadata: dict, **add_kwargs: Any) -> List[str]:
-        self._initialize()
-        ids = []
-        kb_id = str(uuid4())
-
-        kb_record = KB(
-            id=kb_id,
-            name=kb_metadata.get("name"),
-            data_type=kb_metadata.get("data_type"),
-            metadata=kb_metadata.get("metadata"),
-            status=kb_metadata.get("status"),
-            created_by=self.current_user,
-            created_date=datetime.now(),
-            last_modified_by=self.current_user,
-            last_modified_date=datetime.now(),
-            organization_id=self.organization_id,
-            tenant_id=self.tenant_id
-        )
-
-        with self._session() as session, session.begin():
-            session.add(kb_record)
-            for node in nodes:
-                ids.append(node.node_id())
-                item = self._node_to_table_row(node, kb_id)
-                session.add(item)
-            session.commit()
-        return ids
-
-    async def async_add(self, nodes: List[BaseNode], kb_metadata: dict, **kwargs: Any) -> List[str]:
-        self._initialize()
-        ids = []
-        kb_id = str(uuid4())
-
-        kb_record = KB(
-            id=kb_id,
-            name=kb_metadata.get("name"),
-            data_type=kb_metadata.get("data_type"),
-            metadata=kb_metadata.get("metadata"),
-            status=kb_metadata.get("status"),
-            created_by=self.current_user,
-            created_date=datetime.now(),
-            last_modified_by=self.current_user,
-            last_modified_date=datetime.now(),
-            organization_id=self.organization_id,
-            tenant_id=self.tenant_id
-        )
-
-        async with self._async_session() as session, session.begin():
-            session.add(kb_record)
-            for node in nodes:
-                ids.append(node.node_id())
-                item = self._node_to_table_row(node, kb_id)
-                session.add(item)
-            await session.commit()
-        return ids
 
     def _build_query(
         self,
@@ -241,7 +213,7 @@ class PGVectorStore:
         similarities = []
         ids = []
         for row in rows:
-            node = BaseNode()  # Replace with actual node construction
+            node = metadata_dict_to_node(row.item_metadata)
             node.set_content(row.title)
             similarities.append(row.distance)
             ids.append(row.id)
@@ -283,36 +255,6 @@ class PGVectorStore:
             stmt = delete(KBDocs).where(KBDocs.id == ref_doc_id)
             session.execute(stmt)
             session.commit()
-
-    def retrieve_documents(self, conversation):
-        query = VectorStoreQuery()
-        result = self.query(query)
-        return result.nodes
-
-    async def async_retrieve_documents(self, conversation):
-        query = VectorStoreQuery()
-        result = await self.aquery(query)
-        return result.nodes
-
-from custom_document import Document
-
-def _node_to_table_row(self, node: Document, kb_id: str) -> Any:
-    return KBDocs(
-        id=node.node_id(),
-        kb_id=kb_id,
-        embedding=node.get_embedding(),
-        title=node.get_content(),
-        item_metadata=node.get_metadata(),
-        created_by=self.current_user,
-        last_modified_by=self.current_user,
-        organization_id=self.organization_id,
-        tenant_id=self.tenant_id,
-    )
-
-
-
-
-    
 
 
 
