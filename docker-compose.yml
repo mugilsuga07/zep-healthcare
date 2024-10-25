@@ -1,7 +1,7 @@
 services:
   db:
     image: ankane/pgvector
-    container_name: pgsql_jhm_healthcare
+    container_name: pgsql_jhm_flowdb
     ports:
       - 5435:5432
     volumes:
